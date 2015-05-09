@@ -34,21 +34,39 @@ import android.os.UserManager;
 import android.security.Credentials;
 import android.security.IKeyChainService;
 import android.security.KeyChain;
+import android.security.KeyPairGeneratorSpec;
 import android.security.KeyStore;
 import android.util.Log;
 import com.android.internal.util.ParcelableString;
+import com.android.org.bouncycastle.asn1.DERBitString;
+import com.android.org.bouncycastle.asn1.ASN1Set;
+import com.android.org.bouncycastle.asn1.x509.SubjectPublicKeyInfo;
+import com.android.org.bouncycastle.asn1.x509.AlgorithmIdentifier;
+import com.android.org.bouncycastle.asn1.x500.X500Name;
+import com.android.org.bouncycastle.asn1.pkcs.CertificationRequest;
+import com.android.org.bouncycastle.asn1.pkcs.CertificationRequestInfo;
+import com.android.org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
+import com.android.org.bouncycastle.asn1.x9.X9ObjectIdentifiers;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.security.cert.CertificateException;
 import java.security.cert.CertificateEncodingException;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
+import java.security.InvalidKeyException;
+import java.security.NoSuchAlgorithmException;
+import java.security.SignatureException;
+import java.security.KeyPairGenerator;
+import java.security.PrivateKey;
+import java.security.Signature;
 import java.util.Set;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.Collections;
 
+import com.android.org.conscrypt.OpenSSLEngine;
 import com.android.org.conscrypt.TrustedCertificateStore;
+import com.android.org.conscrypt.NativeConstants;
 
 public class KeyChainService extends IntentService {
 
@@ -163,6 +181,87 @@ public class KeyChainService extends IntentService {
                 if (!mKeyStore.delKey(Credentials.USER_PRIVATE_KEY + alias)) {
                     Log.e(TAG, "Failed to delete private key after certificate importing failed");
                 }
+                return false;
+            }
+            broadcastStorageChange();
+            return true;
+        }
+
+        @Override public byte[] generateKeyPair(int uid, String alias, int keyType,
+                int keySize, String subject, byte[] attributes) {
+            try {
+                checkSystemCaller();
+                final String privateKeyAlias = Credentials.USER_PRIVATE_KEY + alias;
+                if (!mKeyStore.generate(privateKeyAlias, -1, keyType, keySize,
+                        KeyStore.FLAG_ENCRYPTED, null)) {
+                    Log.e(TAG, "Failed to generate key " + alias);
+                    return null;
+                }
+                if (mKeyStore.contains(Credentials.USER_CERTIFICATE + alias)) {
+                    if (!mKeyStore.delete(Credentials.USER_CERTIFICATE + alias)) {
+                        Log.e(TAG, "Failed to delete old certificate " + alias);
+                        if (!mKeyStore.delKey(privateKeyAlias)) {
+                            Log.e(TAG, "Failed to delete generated private key after " +
+                                    "certificate deletion failed for " + alias);
+                        }
+                        return null;
+                    }
+                }
+                X500Name X500subject = new X500Name(subject);
+                final byte[] pubKeyBytes = mKeyStore.getPubkey(privateKeyAlias);
+                SubjectPublicKeyInfo spki = SubjectPublicKeyInfo.getInstance(pubKeyBytes);
+
+                CertificationRequestInfo cri = new CertificationRequestInfo(X500subject, spki,
+                        ASN1Set.getInstance(attributes));
+                byte[] encoding = cri.getEncoded();
+                final OpenSSLEngine engine = OpenSSLEngine.getInstance("keystore");
+                PrivateKey pk = engine.getPrivateKeyById(privateKeyAlias);
+                String sigAlg;
+                AlgorithmIdentifier ai;
+                if (keyType == NativeConstants.EVP_PKEY_RSA) {
+                    sigAlg = "sha256WithRSA";
+                    ai = new AlgorithmIdentifier(PKCSObjectIdentifiers.sha256WithRSAEncryption);
+                }
+                else if (keyType == NativeConstants.EVP_PKEY_EC && keySize == 256) {
+                    sigAlg = "sha256WithECDSA";
+                    ai = new AlgorithmIdentifier(X9ObjectIdentifiers.ecdsa_with_SHA256);
+                }
+                else if (keyType == NativeConstants.EVP_PKEY_EC && keySize == 384) {
+                    sigAlg = "sha384WithECDSA";
+                    ai = new AlgorithmIdentifier(X9ObjectIdentifiers.ecdsa_with_SHA384);
+                }
+                else {
+                    Log.e(TAG, "Unsupported algorithm or key size requested for " + alias);
+                    return null;
+                }
+                Signature s = Signature.getInstance(sigAlg);
+                s.initSign(pk);
+                s.update(encoding);
+                byte[] sig = s.sign();
+                CertificationRequest cr = new CertificationRequest(cri, ai, new DERBitString(sig));
+                setGrant(uid, alias, true);
+                return cr.getEncoded();
+            } catch (NoSuchAlgorithmException e) {
+                throw new IllegalStateException(e);
+            } catch (InvalidKeyException e) {
+                throw new IllegalStateException(e);
+            } catch (SignatureException e) {
+                throw new IllegalStateException(e);
+            } catch (IOException e) {
+                throw new IllegalStateException(e);
+            }
+        }
+
+        @Override public boolean setCertificate(int uid, String alias,
+                byte[] certificate) {
+            checkSystemCaller();
+            if (!hasGrantInternal(mDatabaseHelper.getReadableDatabase(), uid, alias)) {
+                Log.e(TAG, "Permission denied - " + uid + " + cannot set certificate for " + alias);
+                return false;
+            }
+            if (!mKeyStore.put(Credentials.USER_CERTIFICATE + alias, certificate, -1,
+                    KeyStore.FLAG_ENCRYPTED)) {
+                Log.e(TAG, "Failed to set user certificate " + alias);
                 return false;
             }
             broadcastStorageChange();
